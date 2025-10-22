@@ -1,0 +1,22 @@
+# Python virtual environment
+/.venv
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Generated content/data folders
+analysis_results/
+vid/
+videos/
+
+# Environment variables - IGNORE the secrets file
+.env
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
