@@ -1,0 +1,5 @@
+google-generativeai
+ollama
+pydantic
+python-dotenv
+opencv-python
