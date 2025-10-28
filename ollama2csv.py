@@ -4,13 +4,13 @@ import logging
 import csv
 import base64
 from pathlib import Path
-from typing import List, TypeVar, Generic, Optional
+from typing import List, TypeVar, Generic, Optional, Any
 from enum import Enum
 from dotenv import load_dotenv
 
 import ollama
 import cv2
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 # --- Setup Logging and Environment ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,10 +35,19 @@ Your **number one priority** is to detect human presence. A false negative (miss
 **CRITICAL RULES**
 ---
 1.  **Return ONLY a valid JSON object.** Do not include explanations, apologies, or any surrounding text.
-2.  **Prioritize Detection Over Confidence:** If you see any shape, movement, or object in any frame that could possibly be a person or human body part, you **MUST** set `"persons": {"value": "Yes"}`. It is better to report "Yes" with low confidence than to miss a person.
-3.  **Provide Confidence:** For each assessment, provide a `value` and a `confidence` score from 0.0 (low) to 1.0 (high).
-4.  **Single Frame Analysis:** You are analyzing only **one single image**. You **CANNOT** detect movement. Therefore, you **MUST** set both `"tank_movement"` and `"turret_movement"` to `{"value": "No", "confidence": 1.0}`. This is mandatory.
-5.  **Assess All Fields:** You **MUST** provide a value for all fields in the schema, even if your confidence is low.
+2.  **Prioritize Detection Over Confidence:** If you see any shape or object that could possibly be a person or human body part, you **MUST** set `"persons": {"value": "Yes"}`. It is better to report "Yes" with low confidence than to miss a person.
+3.  **Faces Imply Persons:** If `"faces_visible": {"value": "Yes"}` is set, then `"persons": {"value": "Yes"}` **MUST** also be set. Persons may be in similar or different outfits; this does not change the analysis.
+4.  **Provide Confidence:** For each assessment, provide a `value` and a `confidence` score from 0.0 (low) to 1.0 (high).
+5.  **Movement Analysis (Single Frame):** You are analyzing only **one single image**.
+    * `"tank_movement"`: Refers to the movement of the vehicle's hull. Only set to "Yes" if the *entire* image shows motion blur relative to the ground.
+    * `"turret_movement"`: Refers to the movement of the turret *that the camera is mounted on*. Set this to "Yes" **only** if the camera's view is clearly moving up, down, left, or right (e.g., rotational blur, or static hull parts are blurred).
+    * If no movement is obvious from this single frame, you **MUST** set both to `{"value": "No", "confidence": 1.0}`.
+6.  **Use Valid Schema Values:** You **MUST** use *only* the exact string values specified in the schema.
+    * `persons`, `tank_movement`, `turret_movement`, `faces_visible`: "Yes" or "No".
+    * `night_day_unknown`: "Day", "Night", or "Unknown".
+    * `area_type`: "Urban", "Open", or "Shelter".
+    * Do not invent new values like "Debris", "Rubble", or "Unknown" for fields that do not allow it.
+7.  **Assess All Fields:** You **MUST** provide a value for all fields in the schema, even if your confidence is low.
 
 ---
 **EXAMPLES**
@@ -73,13 +82,18 @@ class AreaType(str,Enum):
     OPEN = "Open"
     SHELTER = "Shelter"
 
-T = TypeVar('T')
+# --- MODIFIED ConfidenceItem Schema ---
+class ConfidenceItem(BaseModel):
+    """
+    A generic model to hold a value and its confidence score.
+    Value is 'Optional[Any]' to accept unreliable model output without crashing.
+    """
+    # Allow model to skip validation on its 'value' output
+    model_config = ConfigDict(extra='allow') 
 
-class ConfidenceItem(BaseModel, Generic[T]):
-    """A generic model to hold a value and its confidence score."""
-    value: T
-    confidence: float = Field(
-        ...,
+    value: Optional[Any] = None # Accept anything, even null
+    confidence: Optional[float] = Field(
+        default=None, # Accept null confidence
         ge=0.0,
         le=1.0,
         description="The AI's confidence in the value, from 0.0 (no confidence) to 1.0 (certainty)."
@@ -91,13 +105,16 @@ class VideoAnalysis(BaseModel):
     Pydantic schema for video analysis results.
     All fields are optional to handle inconsistent model output.
     """
+    # Allow model to skip validation on extra fields
+    model_config = ConfigDict(extra='allow') 
+    
     video_path: str = ""
-    persons: Optional[ConfidenceItem[YesNo]] = None
-    night_day_unknown: Optional[ConfidenceItem[DayNight]] = None
-    tank_movement: Optional[ConfidenceItem[YesNo]] = None
-    turret_movement: Optional[ConfidenceItem[YesNo]] = None
-    area_type: Optional[ConfidenceItem[AreaType]] = None
-    distance_category: Optional[ConfidenceItem[int]] = Field(
+    persons: Optional[ConfidenceItem] = None
+    night_day_unknown: Optional[ConfidenceItem] = None
+    tank_movement: Optional[ConfidenceItem] = None
+    turret_movement: Optional[ConfidenceItem] = None
+    area_type: Optional[ConfidenceItem] = None
+    distance_category: Optional[ConfidenceItem] = Field(
         default=None,
         description=(
             "Integer from 0-4 representing the distance to the CLOSEST person. "
@@ -105,7 +122,7 @@ class VideoAnalysis(BaseModel):
             "3: Mid (15-50m). 4: Far (50m+)."
         )
     )
-    faces_visible: Optional[ConfidenceItem[YesNo]] = None
+    faces_visible: Optional[ConfidenceItem] = None
     tokens_prompt: int = 0
     tokens_thinking: int = 0  # Note: This will be 0 for Ollama
     tokens_response: int = 0
@@ -205,7 +222,7 @@ def process_video(video_path: Path, client: ollama.Client) -> Optional[VideoAnal
             
             response_json = json.loads(response_string.strip())
             
-            # Use parse_obj to handle potential missing fields gracefully
+            # Use model_validate to handle potential missing fields gracefully
             result = VideoAnalysis.model_validate(response_json)
 
         except json.JSONDecodeError as e:
@@ -296,10 +313,12 @@ def main():
                 if result:
                     # Helper functions to safely get values or 'N/A'
                     def get_val(item: Optional[ConfidenceItem]):
-                        return item.value if item else 'N/A'
+                        # Check if item exists and has a value
+                        return item.value if (item and item.value is not None) else 'N/A'
                     
                     def get_conf(item: Optional[ConfidenceItem]):
-                        return item.confidence if item else 'N/A'
+                        # Check if item exists and has a confidence
+                        return item.confidence if (item and item.confidence is not None) else 'N/A'
 
                     row = [
                         video_path.stem,  # video_name
@@ -318,7 +337,7 @@ def main():
                 else:
                     logging.warning(f"Skipping CSV entry for failed video: {video_path.name}")
         
-        logging.info(f"\nAll videos processed. Results saved in: {csv_output_ch}")
+        logging.info(f"\nAll videos processed. Results saved in: {csv_output_path}")
 
     except IOError as e:
         logging.error(f"Failed to write to CSV file {csv_output_path}: {e}")
@@ -328,3 +347,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
